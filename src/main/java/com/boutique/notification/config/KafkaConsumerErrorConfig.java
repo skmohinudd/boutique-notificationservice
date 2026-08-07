@@ -1,0 +1,3 @@
+package com.boutique.notification.config;
+import org.apache.kafka.common.TopicPartition;import org.springframework.context.annotation.*;import org.springframework.kafka.core.KafkaTemplate;import org.springframework.kafka.listener.*;import org.springframework.util.backoff.FixedBackOff;
+@Configuration public class KafkaConsumerErrorConfig{@Bean CommonErrorHandler notificationKafkaErrorHandler(KafkaTemplate<String,String> template){var recoverer=new DeadLetterPublishingRecoverer(template,(record,error)->new TopicPartition(record.topic()+".dlq",-1));return new DefaultErrorHandler(recoverer,new FixedBackOff(500L,3L));}}

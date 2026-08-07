@@ -1,23 +1,44 @@
 spring:
   application:
     name: notificationservice
-
   main:
     web-application-type: none
-
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
-
     consumer:
       group-id: ${KAFKA_CONSUMER_GROUP:notification-service}
       auto-offset-reset: earliest
       enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-
     listener:
       ack-mode: record
-
-kafka:
-  topics:
-    order-events: ${KAFKA_ORDER_EVENTS_TOPIC:boutique.order.events}
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      connect-timeout: 2s
+      timeout: 2s
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:localhost}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:boutique}
+    password: ${SPRING_RABBITMQ_PASSWORD:boutique_password}
+  mail:
+    host: ${SPRING_MAIL_HOST:localhost}
+    port: ${SPRING_MAIL_PORT:1025}
+app:
+  kafka:
+    order-events-topic: ${KAFKA_ORDER_EVENTS_TOPIC:boutique.order.events}
+    payment-events-topic: ${KAFKA_PAYMENT_EVENTS_TOPIC:boutique.payment.events}
+    shipping-events-topic: ${KAFKA_SHIPPING_EVENTS_TOPIC:boutique.shipping.events}
+notification:
+  dedupe-ttl: ${NOTIFICATION_DEDUPE_TTL:7d}
+  email:
+    default-recipient: ${NOTIFICATION_EMAIL_DEFAULT_RECIPIENT:demo.customer@boutique.local}
+    from: ${NOTIFICATION_EMAIL_FROM:no-reply@boutique.local}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
