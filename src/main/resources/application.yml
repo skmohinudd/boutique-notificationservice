@@ -27,16 +27,20 @@ spring:
   mail:
     host: ${SPRING_MAIL_HOST:localhost}
     port: ${SPRING_MAIL_PORT:1025}
+
 app:
   kafka:
     order-events-topic: ${KAFKA_ORDER_EVENTS_TOPIC:boutique.order.events}
     payment-events-topic: ${KAFKA_PAYMENT_EVENTS_TOPIC:boutique.payment.events}
     shipping-events-topic: ${KAFKA_SHIPPING_EVENTS_TOPIC:boutique.shipping.events}
+
 notification:
+  user-service-url: ${USER_SERVICE_URL:http://userservice:8082}
   dedupe-ttl: ${NOTIFICATION_DEDUPE_TTL:7d}
   email:
     default-recipient: ${NOTIFICATION_EMAIL_DEFAULT_RECIPIENT:demo.customer@boutique.local}
     from: ${NOTIFICATION_EMAIL_FROM:no-reply@boutique.local}
+
 management:
   endpoints:
     web:
