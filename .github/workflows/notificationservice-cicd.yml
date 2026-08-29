@@ -1,0 +1,446 @@
+name: Notification Service CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+# Required for checkout and GitHub OIDC authentication to AWS
+permissions:
+  contents: read
+  id-token: write
+
+# Prevent overlapping Notification deployments
+concurrency:
+  group: notificationservice-${{ github.ref }}
+  cancel-in-progress: false
+
+# Common Notification Service configuration
+env:
+  SERVICE_NAME: notificationservice
+
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "663130434910"
+  ECR_REPOSITORY: boutique-notificationservice
+  EKS_CLUSTER_NAME: boutique-dev-eks
+
+  K8S_NAMESPACE: boutique
+  K8S_DEPLOYMENT: notificationservice
+
+  HELM_RELEASE: notificationservice-dev
+  PLATFORM_REPOSITORY: skmohinudd/boutique-platform-infra
+  HELM_CHART_PATH: boutique-platform-infra/helm/notificationservice
+
+  SONAR_HOST_URL: http://44.199.205.21:9000
+  SONAR_PROJECT_KEY: boutique-notificationservice
+  SONAR_PROJECT_NAME: Boutique Notification Service
+
+
+jobs:
+
+  # Pull requests validate code only; nothing is published or deployed
+  pr-validation:
+    if: github.event_name == 'pull_request'
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      # Fix Windows line endings and Maven wrapper permissions
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+      - name: Run tests
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean test
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN"
+
+
+  # Main pipeline: Maven → Sonar → Nexus → ECR → Helm → EKS
+  deploy-main:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout Notification Service
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Prepare Maven wrapper
+        run: |
+          sed -i 's/\r$//' mvnw
+          chmod +x mvnw
+
+      # Reuse one immutable version across Nexus, ECR and EKS
+      - name: Generate application version
+        run: |
+          APP_VERSION="1.0.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "JAR_NAME=notificationservice-$APP_VERSION.jar" >> "$GITHUB_ENV"
+
+          echo "Application version: $APP_VERSION"
+
+      # Fail early if an important GitHub secret is missing
+      - name: Validate required secrets
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          AWS_GITHUB_ROLE_ARN: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+        run: |
+          for NAME in \
+            SONAR_TOKEN \
+            NEXUS_USERNAME \
+            NEXUS_PASSWORD \
+            AWS_GITHUB_ROLE_ARN
+          do
+            if [ -z "${!NAME}" ]; then
+              echo "Missing required secret: $NAME"
+              exit 1
+            fi
+          done
+
+      # Apply the CI-generated version to Maven
+      - name: Set Maven version
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            versions:set \
+            -DnewVersion="$APP_VERSION" \
+            -DgenerateBackupPoms=false
+
+      # Test and create the versioned Notification JAR
+      - name: Test and build JAR
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            clean package
+
+          test -f "target/$JAR_NAME"
+
+          echo "JAR created: $JAR_NAME"
+
+      # Analyze the exact version being deployed
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar \
+            -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+            -Dsonar.projectName="$SONAR_PROJECT_NAME" \
+            -Dsonar.projectVersion="$APP_VERSION" \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN"
+
+      # Publish the versioned JAR to Nexus
+      - name: Publish JAR to Nexus
+        env:
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          ./mvnw \
+            --batch-mode \
+            --no-transfer-progress \
+            -s .mvn/nexus-settings.xml \
+            deploy \
+            -DskipTests
+
+      # Authenticate GitHub to AWS using OIDC
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: notificationservice-${{ github.run_id }}
+          allowed-account-ids: "663130434910"
+
+      # Verify the expected AWS account and Notification ECR repository
+      - name: Validate AWS and ECR
+        run: |
+          ACCOUNT="$(aws sts get-caller-identity \
+            --query Account \
+            --output text)"
+
+          if [ "$ACCOUNT" != "$AWS_ACCOUNT_ID" ]; then
+            echo "Expected AWS account: $AWS_ACCOUNT_ID"
+            echo "Actual AWS account  : $ACCOUNT"
+            exit 1
+          fi
+
+          aws ecr describe-repositories \
+            --repository-names "$ECR_REPOSITORY" \
+            --region "$AWS_REGION" \
+            > /dev/null
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the immutable Notification worker image
+      - name: Build Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE_REPOSITORY="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          IMAGE_URI="${IMAGE_REPOSITORY}:${APP_VERSION}"
+
+          echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY" >> "$GITHUB_ENV"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+          docker build \
+            --label "org.opencontainers.image.version=$APP_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE_URI" \
+            .
+
+      # Trivy remains disabled until the existing scan/cache issue is fixed
+
+      - name: Push image to ECR
+        run: |
+          docker push "$IMAGE_URI"
+
+      # Confirm the image exists in ECR and capture its digest
+      - name: Validate ECR image
+        run: |
+          IMAGE_DIGEST="$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$APP_VERSION" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "None" ]; then
+            echo "Notification image was not found in ECR"
+            exit 1
+          fi
+
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v5.1.0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v5.0.0
+
+      # Checkout the centralized Notification Helm chart
+      - name: Checkout platform repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPOSITORY }}
+          path: boutique-platform-infra
+          persist-credentials: false
+
+      # Validate Helm before changing the running worker
+      - name: Validate Helm chart
+        run: |
+          helm lint "$HELM_CHART_PATH"
+
+          helm template \
+            "$HELM_RELEASE" \
+            "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            > /dev/null
+
+      # Connect kubectl to the Boutique EKS cluster
+      - name: Configure EKS access
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME" \
+            > /dev/null
+
+          test "$(kubectl auth can-i get deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+          test "$(kubectl auth can-i patch deployments \
+            -n "$K8S_NAMESPACE")" = "yes"
+
+      # Notification depends on these shared runtime services
+      - name: Validate Notification dependencies
+        run: |
+          kubectl get svc kafka \
+            -n "$K8S_NAMESPACE" \
+            > /dev/null
+
+          kubectl get svc rabbitmq \
+            -n "$K8S_NAMESPACE" \
+            > /dev/null
+
+          kubectl get svc redis \
+            -n "$K8S_NAMESPACE" \
+            > /dev/null
+
+          kubectl get svc mailpit \
+            -n "$K8S_NAMESPACE" \
+            > /dev/null
+
+          kubectl get svc userservice \
+            -n "$K8S_NAMESPACE" \
+            > /dev/null
+
+          echo "Notification dependencies verified"
+
+      # Stop if another Helm operation is unfinished
+      - name: Check Helm release state
+        run: |
+          STATUS="$(helm status "$HELM_RELEASE" \
+            -n "$K8S_NAMESPACE" \
+            -o json \
+            2>/dev/null \
+            | jq -r '.info.status // "not-installed"' \
+            || echo "not-installed")"
+
+          case "$STATUS" in
+            pending-install|pending-upgrade|pending-rollback)
+              echo "Helm release is stuck: $STATUS"
+              exit 1
+              ;;
+          esac
+
+      # Deploy the worker using its centralized Helm chart
+      - name: Deploy Notification Service with Helm
+        run: |
+          helm upgrade --install \
+            "$HELM_RELEASE" \
+            "$HELM_CHART_PATH" \
+            --namespace "$K8S_NAMESPACE" \
+            --set image.repository="$IMAGE_REPOSITORY" \
+            --set image.tag="$APP_VERSION" \
+            --atomic \
+            --cleanup-on-fail \
+            --history-max 5 \
+            --wait \
+            --timeout 5m
+
+      # Wait until Kubernetes finishes the worker rollout
+      - name: Validate Kubernetes rollout
+        run: |
+          kubectl rollout status \
+            deployment/"$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            --timeout=180s
+
+      # Verify EKS is running the exact image built by this workflow
+      - name: Validate deployed worker
+        run: |
+          DEPLOYED_IMAGE="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          READY="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.status.readyReplicas}')"
+
+          DESIRED="$(kubectl get deployment "$K8S_DEPLOYMENT" \
+            -n "$K8S_NAMESPACE" \
+            -o jsonpath='{.spec.replicas}')"
+
+          if [ "$DEPLOYED_IMAGE" != "$IMAGE_URI" ]; then
+            echo "Expected image: $IMAGE_URI"
+            echo "Running image : $DEPLOYED_IMAGE"
+            exit 1
+          fi
+
+          if [ "${READY:-0}" != "$DESIRED" ]; then
+            echo "Ready workers: ${READY:-0}/${DESIRED}"
+            exit 1
+          fi
+
+          echo "Notification worker is running"
+          echo "Ready workers: $READY/$DESIRED"
+
+      # Worker has no HTTP endpoint, so rollout/readiness is the health check
+      - name: Check worker restarts
+        run: |
+          RESTARTS="$(kubectl get pods \
+            -n "$K8S_NAMESPACE" \
+            -l app="$SERVICE_NAME" \
+            -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{"\n"}{end}')"
+
+          echo "Worker restart counts:"
+          echo "$RESTARTS"
+
+          if echo "$RESTARTS" | grep -Ev '^0$|^$' | grep -q .; then
+            echo "Notification worker restarted after deployment"
+            exit 1
+          fi
+
+      # Show only the important deployment identities
+      - name: Deployment summary
+        run: |
+          echo "Notification Service deployment completed"
+          echo "Version : $APP_VERSION"
+          echo "JAR     : $JAR_NAME"
+          echo "Image   : $IMAGE_URI"
+          echo "Digest  : $IMAGE_DIGEST"
+          echo "Helm    : $HELM_RELEASE"
