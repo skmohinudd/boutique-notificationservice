@@ -170,3 +170,8 @@ github-sync-reports/
 .plain-lambda-backups/
 .final-consolidated-backups/
 .lambda-image-removal-backups/
+id_rsa
+id_ed25519
+*credentials*
+*secret*.txt
+.automation-logs/
